@@ -79,13 +79,12 @@
 
 */
 
-#include <stdio.h>
 
 #include "reference_calc.cpp"
 #include "utils.h"
 
 __global__
-void reduceMin_g(float* d_in, float* d_out, const size_t size) {
+void reduceMin_global(float* d_in, float* d_out, const size_t size) {
         const int bid = threadIdx.x + blockIdx.x * blockDim.x;
         const int tid = threadIdx.x;
 
@@ -105,10 +104,8 @@ void reduceMin_g(float* d_in, float* d_out, const size_t size) {
 }
 
 float reduceMin(const float* const d_buffer, const size_t buffer_size) {
-        printf("Iniciar reduceMin\n");
-        int threads = 1024;
-        int blocks = (buffer_size + threads - 1) / threads;
-        printf("block size %d\n", blocks);
+        int threads = 512;
+        unsigned int blocks = (buffer_size + threads - 1) / threads;
 
         float* d_in = NULL;
         float* d_out = NULL;
@@ -116,27 +113,92 @@ float reduceMin(const float* const d_buffer, const size_t buffer_size) {
         size_t size = buffer_size;
 
         checkCudaErrors(cudaMalloc(&d_in, sizeof(const float) * buffer_size));
-        cudaMemcpy(d_in, d_buffer, sizeof(const float) * buffer_size, 
-                        cudaMemcpyDeviceToDevice);
+        checkCudaErrors(cudaMemcpy(d_in, d_buffer, sizeof(const float) * buffer_size, 
+                        cudaMemcpyDeviceToDevice));
         checkCudaErrors(cudaMalloc(&d_out, sizeof(const float) * blocks));
-        cudaMemset(d_out, 0.0, sizeof(const float) * blocks);
-        while (blocks > threads) {printf("block size %d\n", blocks);
-//                reduceMin_g<<<blocks, threads>>>(d_in, d_out, size);
+        checkCudaErrors(cudaMemset(d_out, 0.0, sizeof(const float) * blocks));
+        
+        while (blocks > 1) {
+                reduceMin_global<<<blocks, threads>>>(d_in, d_out, size);
 
                 cudaFree(d_in);
-                d_out = d_in;
+                d_in = d_out;
                 size = blocks;
+                
                 blocks = blocks / threads;
+                checkCudaErrors(cudaMalloc(&d_out, sizeof(const float) * size));
+                checkCudaErrors(cudaMemset(d_out, 0.0, sizeof(const float) * size));
         }
 
- //       reduceMin_global<<<1, threads>>>(d_in, d_out, size);
+        reduceMin_global<<<1, size>>>(d_in, d_out, size);
 
-        float min = d_out[0];
+        float h_min[size];
+        checkCudaErrors(cudaMemcpy(h_min, d_out, sizeof(float) * size, 
+                        cudaMemcpyDeviceToHost));
 
         cudaFree(d_in);
         cudaFree(d_out);
 
-        return min;
+        return h_min[0];
+}
+
+__global__
+void reduceMax_global(float* d_in, float* d_out, const size_t size) {
+        const int bid = threadIdx.x + blockIdx.x * blockDim.x;
+        const int tid = threadIdx.x;
+
+        for (unsigned int step = blockDim.x / 2; step > 0; step >>= 1) {
+                if (tid < step) {
+                        if (d_in[bid] < d_in[bid + step]) {
+                                d_in[bid] = d_in[bid + step];
+                        }
+                }
+
+                __syncthreads();
+        }
+
+        if (tid == 0) {
+                d_out[tid] = d_in[bid];
+        }
+}
+
+float reduceMax(const float* const d_buffer, const size_t buffer_size) {
+        int threads = 512;
+        unsigned int blocks = (buffer_size + threads - 1) / threads;
+
+        float* d_in = NULL;
+        float* d_out = NULL;
+
+        size_t size = buffer_size;
+
+        checkCudaErrors(cudaMalloc(&d_in, sizeof(const float) * buffer_size));
+        checkCudaErrors(cudaMemcpy(d_in, d_buffer, sizeof(const float) * buffer_size, 
+                        cudaMemcpyDeviceToDevice));
+        checkCudaErrors(cudaMalloc(&d_out, sizeof(const float) * blocks));
+        checkCudaErrors(cudaMemset(d_out, 0.0, sizeof(const float) * blocks));
+        
+        while (blocks > 1) {
+                reduceMax_global<<<blocks, threads>>>(d_in, d_out, size);
+
+                cudaFree(d_in);
+                d_in = d_out;
+                size = blocks;
+                
+                blocks = blocks / threads;
+                checkCudaErrors(cudaMalloc(&d_out, sizeof(const float) * size));
+                checkCudaErrors(cudaMemset(d_out, 0.0, sizeof(const float) * size));
+        }
+
+        reduceMin_global<<<1, size>>>(d_in, d_out, size);
+
+        float h_max[size];
+        checkCudaErrors(cudaMemcpy(h_max, d_out, sizeof(float) * size, 
+                        cudaMemcpyDeviceToHost));
+
+        cudaFree(d_in);
+        cudaFree(d_out);
+
+        return h_max[0];
 }
 
 void your_histogram_and_prefixsum(const float* const d_logLuminance,
@@ -147,16 +209,14 @@ void your_histogram_and_prefixsum(const float* const d_logLuminance,
                                   const size_t numCols,
                                   const size_t numBins)
 {
-
         // Size of log luminance
         const size_t size = numCols * numRows;
 
-        // 1) find the minimum and maximum value in the  input logLuminance 
+        // 1) find the minimum and maximum value in the input logLuminance 
         //    channel store in min_logLum and max_logLum
-        printf("Executar reduceMin\n");
         min_logLum = reduceMin(d_logLuminance, size);
-        printf("min_logLum %f\n", min_logLum);
-        
+        max_logLum = reduceMax(d_logLuminance, size);
+    
         // 2) subtract them to find the range
         float range = max_logLum - min_logLum;
 
